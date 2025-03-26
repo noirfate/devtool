@@ -11,6 +11,10 @@ import httpx
 from tqdm import tqdm
 from datetime import datetime, timezone, timedelta
 
+FAKE_REPO = 0       # 无效仓库
+RELATED_REPO = 1    # 相关仓库
+POC_REPO = 2        # 包含POC的仓库
+
 class PocSeeker:
     def __init__(self, cve=None, github_token=None, nvd_key=None, days=1):
         self.cve = None if not cve else cve.upper()
@@ -67,7 +71,7 @@ class PocSeeker:
         return cve_detail
 
     def check_github_repo(self, repo, headers):
-        quality = 0
+        quality = FAKE_REPO
 
         try:
             url_content = f"https://api.github.com/repos/{repo}/contents"
@@ -84,6 +88,7 @@ class PocSeeker:
 
         repo_with_readme = any(re.search(r"README\.md", fname, re.IGNORECASE) for fname in file_list)
         required_extension_found = any(any(fname.endswith(ext) for ext in self.ext) for fname in file_list)
+        comment='''
         cve_found = False
         if repo_with_readme:
             readme_url_main = f"https://raw.githubusercontent.com/{repo}/main/README.md"
@@ -101,16 +106,17 @@ class PocSeeker:
                             cve_found = True
             except:
                 pass
+        '''
 
-        if required_extension_found and cve_found:
-            quality = 2
+        if required_extension_found and repo_with_readme:
+            quality = POC_REPO
         else:
-            quality = 1
+            quality = RELATED_REPO
         
         return quality
 
     def add_finding(self, cve, quality, info):
-        if quality == 2:
+        if quality == POC_REPO:
             if self.potential_findings.get(cve):
                 for i in self.potential_findings[cve]:
                     if i["link"] == info["link"]:
@@ -118,7 +124,7 @@ class PocSeeker:
             else:
                 self.potential_findings[cve] = []
             self.potential_findings[cve].append(info)
-        elif quality == 1:
+        elif quality == RELATED_REPO:
             if self.have_a_look.get(cve):
                 for i in self.have_a_look[cve]:
                     if i["link"] == info["link"]:
@@ -198,9 +204,9 @@ class PocSeeker:
                     info["link"] = exploit.get("href", "")
                     info["time"] = exploit.get("published", "")
                     if re.search(self.cve, info["desc"], re.IGNORECASE):
-                        self.add_finding(self.cve, 2, info)
+                        self.add_finding(self.cve, POC_REPO, info)
                     else:
-                        self.add_finding(self.cve, 1, info)
+                        self.add_finding(self.cve, RELATED_REPO, info)
 
                 offset += 10
                 if offset > max_items:
