@@ -16,11 +16,11 @@ RELATED_REPO = 1    # 相关仓库
 POC_REPO = 2        # 包含POC的仓库
 
 class PocSeeker:
-    def __init__(self, cve=None, github_token=None, nvd_key=None, days=1):
+    def __init__(self, cve=None, github_token=None, nvd_key=None, hours=1):
         self.cve = None if not cve else cve.upper()
         self.nvd_key = nvd_key
         self.github_token = github_token
-        self.days = days
+        self.hours = hours
         self.potential_findings = {} 
         self.have_a_look = {}
         self.user_agents = [
@@ -30,12 +30,17 @@ class PocSeeker:
             "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:85.0) Gecko/20100101 Firefox/85.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
         ]
-        self.ext = [".py", ".rb", ".pl", ".sh", ".ps1", ".bat", ".js", ".php", ".c", ".cpp", ".go", ".lua", ".rs", ".swift"]
+        self.ext = [".py", ".rb", ".pl", ".sh", ".ps1", ".bat", ".js", ".php", ".c", ".cpp", ".go", ".lua", ".rs", ".swift", ".ts"]
         self.sources = ["github", "sploitus", "packetstormsecurity"]
         self.random_ua = random.choice(self.user_agents)
         self.h2client = httpx.Client(http2=True, verify=False, timeout=30)
         self.client = httpx.Client(verify=False, timeout=30)
         self.beijing_tz = timezone(timedelta(hours=8))
+        
+        # 缓存文件路径
+        self.cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pocseeker_cache.json")
+        # 初始时不加载缓存，仅在需要时加载
+        self.repo_cache = {}
 
     def __del__(self):
         self.client.close()
@@ -72,22 +77,49 @@ class PocSeeker:
 
     def check_github_repo(self, repo, headers):
         quality = FAKE_REPO
+        file_list = []
 
-        try:
-            url_content = f"https://api.github.com/repos/{repo}/contents"
-            resp = self.h2client.get(url_content, headers=headers)
-            file_list = []
-            if resp.status_code == 200:
+        # 递归获取仓库中的所有文件
+        def get_repo_files(path=""):
+            try:
+                url_content = f"https://api.github.com/repos/{repo}/contents/{path}"
+                resp = self.h2client.get(url_content, headers=headers)
+                if resp.status_code != 200:
+                    return
+
                 contents = resp.json()
-                for cont in contents:
-                    file_list.append(cont.get("name", ""))
-            else:
+                # 如果返回的是单个文件（不是目录列表），则内容会是一个字典而不是列表
+                if not isinstance(contents, list):
+                    return
+
+                for item in contents:
+                    if item.get("type") == "file":
+                        # 存储完整路径
+                        file_path = item.get("path", "")
+                        file_list.append(file_path)
+                    elif item.get("type") == "dir":
+                        # 递归检查子目录
+                        sub_path = item.get("path", "")
+                        get_repo_files(sub_path)
+            except Exception as e:
+                print(f"Error checking repo directory {path}: {e}")
+                return
+
+        # 开始递归检查
+        try:
+            get_repo_files()
+            if not file_list:  # 如果文件列表为空，说明可能无法访问或仓库为空
                 return quality
-        except Exception:
+        except Exception as e:
+            print(f"Error checking repo {repo} directory: {e}")
             return quality
 
+        # 检查是否有README.md文件
         repo_with_readme = any(re.search(r"README\.md", fname, re.IGNORECASE) for fname in file_list)
+        
+        # 检查是否包含指定后缀的文件
         required_extension_found = any(any(fname.endswith(ext) for ext in self.ext) for fname in file_list)
+        
         comment='''
         cve_found = False
         if repo_with_readme:
@@ -253,23 +285,36 @@ class PocSeeker:
     def set_nvd_key(self, nvd_key):
         self.nvd_key = nvd_key
     
-    def set_days(self, days):
-        self.days = days
+    def set_hours(self, hours):
+        self.hours = hours
     
     def clear_findings(self):
         self.potential_findings = {}
         self.have_a_look = {}
 
-    def updates(self):
+    def updates(self, no_cache=True):
         self.clear_findings()
 
         current_time = datetime.now(self.beijing_tz)
+        if no_cache:
+            print(f"搜索最近 {self.hours} 小时内更新的CVE相关仓库...(未启用缓存)")
+            # 使用空缓存
+            self.repo_cache = {}
+        else:
+            print(f"搜索最近 {self.hours} 小时内更新的CVE相关仓库...(已启用缓存)")
+            # 加载缓存
+            self.repo_cache = self.load_cache()
+        
         headers = {"Accept": "application/vnd.github+json"}
         if self.github_token:
             headers["Authorization"] = f"token {self.github_token}"
         
         page = 1
         total_processed = 0
+        new_repos = 0
+        cached_repos = 0
+        
+        updated_cache = {}
         
         try:
             while True:
@@ -290,21 +335,45 @@ class PocSeeker:
                     if not found_cve:
                         continue
 
+                    repo_full_name = item["full_name"]
+                    repo_url = item["html_url"]
+                    cve_id = found_cve.group()
                     push_time = datetime.strptime(item["pushed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(self.beijing_tz)
-                    # 检查是否在指定的时间范围内
-                    days_diff = (current_time - push_time).days
-                    if days_diff > self.days:
+                    
+                    # 检查是否在指定的时间范围内，用小时为单位
+                    time_diff = current_time - push_time
+                    hours_diff = time_diff.total_seconds() // 3600  # 转换为小时
+                    if hours_diff >= self.hours:
+                        # 保存缓存然后返回结果
+                        if not no_cache:
+                            self.save_cache(updated_cache)
+                            print(f"\n处理完成：发现 {new_repos} 个新仓库，跳过 {cached_repos} 个已缓存仓库")
                         return {"good": self.potential_findings, "doubt": self.have_a_look}
-                        
+                    
+                    # 检查是否在缓存中，如果禁用缓存则跳过检查
+                    if not no_cache and repo_url in self.repo_cache:
+                        cached_repos += 1
+                        continue
+                    
+                    # 新仓库，处理并添加到缓存
+                    new_repos += 1
                     info = {}
-                    info["id"] = found_cve.group()
-                    info["name"] = item["full_name"]
+                    info["id"] = cve_id
+                    info["name"] = repo_full_name
                     info["src"] = "github"
                     info["desc"] = item["description"]
-                    info["link"] = item["html_url"]
+                    info["link"] = repo_url
                     info["time"] = push_time.strftime("%Y-%m-%d %H:%M:%S")
-                    quality = self.check_github_repo(item["full_name"], headers)
+                    quality = self.check_github_repo(repo_full_name, headers)
                     self.add_finding(info["id"], quality, info)
+                    
+                    # 添加到缓存（如果未禁用缓存）
+                    if not no_cache:
+                        updated_cache[repo_url] = {
+                            "cve_id": cve_id,
+                            "quality": quality
+                        }
+                    
                     total_processed += 1
 
                 page += 1
@@ -316,6 +385,11 @@ class PocSeeker:
                     break
         except Exception as e:
             print(f"Error searching GitHub repositories: {e}")
+        
+        # 保存更新后的缓存（如果未禁用缓存）
+        if not no_cache:
+            self.save_cache(updated_cache)
+            print(f"\n处理完成：发现 {new_repos} 个新仓库，跳过 {cached_repos} 个已缓存仓库")
         
         return {"good": self.potential_findings, "doubt": self.have_a_look}
     
@@ -330,26 +404,46 @@ class PocSeeker:
             for k, v in self.have_a_look.items():
                 print(json.dumps(v, indent=2))
     
+    def load_cache(self):
+        """加载缓存文件，如果文件不存在或格式错误则返回空字典"""
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"加载缓存文件时出错: {e}")
+                print("将使用空缓存继续")
+                return {}
+        else:
+            return {}
+
+    def save_cache(self, data):
+        """保存缓存到文件，处理可能的IO错误"""
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(data, f)
+        except IOError as e:
+            print(f"保存缓存文件时出错: {e}")
+            print("程序将继续执行，但本次缓存未保存")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Search for POC of CVE')
     parser.add_argument('-q', '--query', type=str, help='CVE number to search for')
-    parser.add_argument('-u', '--update', type=int, default=1, help='fetch POCs from N days ago until now')
+    parser.add_argument('-u', '--update', type=int, default=1, help='fetch POCs from N hours ago until now')
     parser.add_argument('-s', '--source', type=str, help='Search sources separated by comma (github,sploitus)')
     parser.add_argument('--github-token', type=str, help='GitHub access token')
     parser.add_argument('--nvd-key', type=str, help='NVD API key')
     parser.add_argument('--enable-nvd', action='store_true', help='Enable NVD information collection')
+    parser.add_argument('--use-cache', action='store_true', help='Enable repository cache (disabled by default)')
     args = parser.parse_args()
 
-    # 验证CVE格式
+    # 创建PocSeeker实例，不论是否有CVE参数
     if args.query:
         cve_match = re.search(r'CVE-\d{4}-\d{4,}', args.query, re.IGNORECASE)
         if not cve_match:
             print("Error: Invalid CVE format. Example: CVE-2023-12345")
             sys.exit(1)
-    
         cve = cve_match.group(0)
-    
-        # 创建PocSeeker实例
         seeker = PocSeeker(
             cve=cve,
             github_token=args.github_token,
@@ -359,9 +453,9 @@ if __name__ == "__main__":
         seeker = PocSeeker(
             github_token=args.github_token,
             nvd_key=args.nvd_key,
-            days=args.update
+            hours=args.update
         )
-
+    
     # 设置搜索源
     if args.source:
         seeker.set_sources(args.source)
@@ -394,5 +488,5 @@ if __name__ == "__main__":
         seeker.search()
         seeker.print_results()
     elif args.update:
-        seeker.updates()
+        seeker.updates(no_cache=not args.use_cache)
         seeker.print_results()
