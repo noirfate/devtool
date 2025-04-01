@@ -311,7 +311,6 @@ class PocSeeker:
         
         page = 1
         total_processed = 0
-        new_repos = 0
         cached_repos = 0
         
         updated_cache = {}
@@ -347,7 +346,7 @@ class PocSeeker:
                         # 保存缓存然后返回结果
                         if not no_cache:
                             self.save_cache(updated_cache)
-                            print(f"\n处理完成：发现 {new_repos} 个新仓库，跳过 {cached_repos} 个已缓存仓库")
+                            print(f"\n处理完成：发现 {total_processed} 个新仓库，跳过 {cached_repos} 个已缓存仓库")
                         return {"good": self.potential_findings, "doubt": self.have_a_look}
                     
                     # 检查是否在缓存中，如果禁用缓存则跳过检查
@@ -355,8 +354,6 @@ class PocSeeker:
                         cached_repos += 1
                         continue
                     
-                    # 新仓库，处理并添加到缓存
-                    new_repos += 1
                     info = {}
                     info["id"] = cve_id
                     info["name"] = repo_full_name
@@ -389,7 +386,7 @@ class PocSeeker:
         # 保存更新后的缓存（如果未禁用缓存）
         if not no_cache:
             self.save_cache(updated_cache)
-            print(f"\n处理完成：发现 {new_repos} 个新仓库，跳过 {cached_repos} 个已缓存仓库")
+            print(f"\n处理完成：发现 {total_processed} 个新仓库，跳过 {cached_repos} 个已缓存仓库")
         
         return {"good": self.potential_findings, "doubt": self.have_a_look}
     
