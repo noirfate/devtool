@@ -336,7 +336,7 @@ class PocSeeker:
 
                     repo_full_name = item["full_name"]
                     repo_url = item["html_url"]
-                    cve_id = found_cve.group()
+                    cve_id = found_cve.group().upper()
                     push_time = datetime.strptime(item["pushed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(self.beijing_tz)
                     
                     # 检查是否在指定的时间范围内，用小时为单位
